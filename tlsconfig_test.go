@@ -4,105 +4,402 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"strings"
 	"testing"
 
+	configv1 "github.com/openshift/api/config/v1"
+	openshifttls "github.com/openshift/controller-runtime-common/pkg/tls"
+	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	testclient "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
+	restfake "k8s.io/client-go/rest/fake"
 	k8stesting "k8s.io/client-go/testing"
 	sdktls "open-cluster-management.io/sdk-go/pkg/tls"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
-// allowSelfSubjectAccessReviews makes a fake clientset report every SelfSubjectAccessReview as
-// allowed. Without this, the fake client's default "create" reaction just stores and echoes back
-// the submitted object, leaving Status.Allowed at its false zero value - indistinguishable from a
-// real permission denial.
-func allowSelfSubjectAccessReviews(client *testclient.Clientset) {
+func TestResolveTLSConfigFlagsTakePrecedence(t *testing.T) {
+	wantVersion, err := sdktls.ParseTLSVersion("VersionTLS12")
+	require.NoError(t, err)
+
+	wantCiphers, unsupported := sdktls.ParseCipherSuites("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
+	require.Empty(t, unsupported)
+
+	tlsOptsFunc, watchAPIServer, spec, err := resolveEffectiveTLSConfig(
+		t.Context(), nil, "VersionTLS12", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "X25519")
+
+	require.NoError(t, err)
+	assert.False(t, watchAPIServer, "group flag means no APIServer watcher")
+	assert.Equal(t, configv1.TLSProfileSpec{}, spec)
+
+	got := &tls.Config{}
+	tlsOptsFunc(got)
+
+	assert.Equal(t, wantVersion, got.MinVersion)
+	assert.Equal(t, wantCiphers, got.CipherSuites)
+	assert.Equal(t, []tls.CurveID{tls.X25519}, got.CurvePreferences)
+}
+
+func TestResolveTLSConfigAPIServerProfile(t *testing.T) {
+	_, watchAPIServer, resolvedSpec, err := resolveEffectiveTLSConfig(
+		t.Context(), newFakeAPIServer(t, true), "", "", "")
+
+	require.NoError(t, err)
+	assert.True(t, watchAPIServer)
+	assert.Equal(t, configv1.TLSProfiles[configv1.TLSProfileModernType].Groups, resolvedSpec.Groups)
+}
+
+func TestResolveTLSConfigUnsupportedAPIServerGroups(t *testing.T) {
+	tlsOptsFunc, watchAPIServer, spec, err := resolveEffectiveTLSConfig(
+		t.Context(), newFakeAPIServer(t, true, "BogusGroup"), "", "", "")
+
+	require.NoError(t, err)
+	assert.True(t, watchAPIServer)
+	assert.Equal(t, []configv1.TLSGroup{"BogusGroup"}, spec.Groups)
+
+	got := &tls.Config{}
+	tlsOptsFunc(got)
+
+	assert.Empty(t, got.CurvePreferences, "unsupported groups must not set curve preferences")
+}
+
+func TestResolveTLSConfigNoFlagsNoClusterUsesDefaults(t *testing.T) {
+	tlsOptsFunc, watchAPIServer, spec, err := resolveEffectiveTLSConfig(t.Context(), nil, "", "", "")
+
+	require.NoError(t, err)
+	assert.False(t, watchAPIServer)
+	assert.Equal(t, configv1.TLSProfileSpec{}, spec)
+
+	got := &tls.Config{}
+	tlsOptsFunc(got)
+
+	assert.Equal(t, sdktls.GetDefaultTLSConfig().MinVersion, got.MinVersion)
+}
+
+func TestResolveTLSConfigInvalidInputReturnsError(t *testing.T) {
+	tests := []struct {
+		name       string
+		minVersion string
+		groups     string
+		wantErrIs  error
+	}{
+		{name: "invalid groups", groups: "not-a-group", wantErrIs: errInvalidTLSGroups},
+		{name: "invalid min version", minVersion: "not-a-version"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tlsOptsFunc, watchAPIServer, spec, err := resolveEffectiveTLSConfig(
+				t.Context(), nil, tt.minVersion, "", tt.groups)
+
+			require.Error(t, err)
+
+			if tt.wantErrIs != nil {
+				require.ErrorIs(t, err, tt.wantErrIs)
+			}
+
+			assert.Nil(t, tlsOptsFunc)
+			assert.False(t, watchAPIServer)
+			assert.Equal(t, configv1.TLSProfileSpec{}, spec)
+		})
+	}
+}
+
+func TestStartTLSConfigMapWatcherReadsConfigMap(t *testing.T) {
+	kubeClient := testclient.NewSimpleClientset(newTLSConfigMap(map[string]string{
+		sdktls.ConfigMapKeyMinVersion: "VersionTLS13",
+	}))
+	allowSelfSubjectAccessReviews(kubeClient)
+
+	configMapCfg, err := startTLSConfigMapWatcher(t.Context(), kubeClient, "addon-ns")
+	require.NoError(t, err)
+	require.NotNil(t, configMapCfg)
+
+	wantVersion, err := sdktls.ParseTLSVersion("VersionTLS13")
+	require.NoError(t, err)
+	assert.Equal(t, wantVersion, configMapCfg.MinVersion)
+}
+
+func TestStartTLSConfigMapWatcher(t *testing.T) {
+	allowedClient := testclient.NewSimpleClientset()
+	allowSelfSubjectAccessReviews(allowedClient)
+
+	errorClient := testclient.NewSimpleClientset()
+	errorClient.PrependReactor("create", "selfsubjectaccessreviews",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("review failed")
+		},
+	)
+
+	deniedClient := testclient.NewSimpleClientset(newTLSConfigMap(nil))
+
+	defaultMinVersion := sdktls.GetDefaultTLSConfig().MinVersion
+
+	tests := []struct {
+		name           string
+		client         *testclient.Clientset
+		wantErr        string
+		wantMinVersion uint16
+	}{
+		{name: "no config map uses default", client: allowedClient, wantMinVersion: defaultMinVersion},
+		{name: "missing perm returns error", client: deniedClient, wantErr: "missing permission"},
+		{name: "permission check error", client: errorClient, wantErr: "failed to check permission to watch"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configMapCfg, err := startTLSConfigMapWatcher(t.Context(), tt.client, "addon-ns")
+
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, configMapCfg)
+			assert.Equal(t, tt.wantMinVersion, configMapCfg.MinVersion)
+		})
+	}
+}
+
+func TestReadAPIServerTLSProfileSpecClientError(t *testing.T) {
+	cfg := &rest.Config{
+		Host:            "https://api.example.test",
+		TLSClientConfig: rest.TLSClientConfig{CAData: []byte("not a certificate")},
+	}
+
+	spec, watchable := readAPIServerTLSProfileSpec(t.Context(), cfg)
+
+	assert.Equal(t, configv1.TLSProfileSpec{}, spec)
+	assert.False(t, watchable)
+}
+
+func TestFetchAPIServerTLSProfileSpecErrorHandling(t *testing.T) {
+	apiServerGR := schema.GroupResource{Group: configv1.GroupName, Resource: "apiservers"}
+
+	tests := []struct {
+		name          string
+		getErr        error
+		wantWatchable bool
+	}{
+		{
+			name:   "forbidden means use defaults",
+			getErr: apierrors.NewForbidden(apiServerGR, openshifttls.APIServerName, errors.New("forbidden")),
+		},
+		{
+			name:   "not found means the profile is not served",
+			getErr: apierrors.NewNotFound(apiServerGR, openshifttls.APIServerName),
+		},
+		{
+			name: "no matching resource means the profile is not served",
+			getErr: &meta.NoResourceMatchError{PartialResource: schema.GroupVersionResource{
+				Group: apiServerGR.Group, Resource: apiServerGR.Resource,
+			}},
+		},
+		{
+			name:   "transient error does not watch",
+			getErr: errors.New("connection refused"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apiServerClient := fakeclient.NewClientBuilder().
+				WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(_ context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object,
+						_ ...client.GetOption,
+					) error {
+						return tt.getErr
+					},
+				}).
+				Build()
+
+			spec, watchable := fetchAPIServerTLSProfileSpec(t.Context(), apiServerClient)
+
+			assert.Equal(t, tt.wantWatchable, watchable)
+			assert.Equal(t, configv1.TLSProfileSpec{}, spec)
+		})
+	}
+}
+
+// newTLSConfigManager builds a real manager without starting it, so no goroutines run.
+func newTLSConfigManager(t *testing.T, cfg *rest.Config) ctrl.Manager {
+	t.Helper()
+
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:  scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
+	})
+	require.NoError(t, err)
+
+	return mgr
+}
+
+func TestSetupAPIServerTLSWatcherSkipsWhenWatchCheckFails(t *testing.T) {
+	mgr := newTLSConfigManager(t, &rest.Config{Host: "https://127.0.0.1:1"})
+
+	require.NoError(t, setupAPIServerTLSWatcher(t.Context(), mgr, configv1.TLSProfileSpec{}))
+}
+
+func TestSetupAPIServerTLSWatcherRegistersWhenAllowed(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"apiVersion":"authorization.k8s.io/v1",` +
+			`"kind":"SelfSubjectAccessReview","status":{"allowed":true}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	mgr := newTLSConfigManager(t, &rest.Config{
+		Host:            server.URL,
+		TLSClientConfig: rest.TLSClientConfig{Insecure: true},
+	})
+
+	require.NoError(t, setupAPIServerTLSWatcher(t.Context(), mgr, configv1.TLSProfileSpec{}))
+}
+
+func TestOnTLSProfileChangeIgnoresSameGroups(t *testing.T) {
+	spec := configv1.TLSProfileSpec{Groups: []configv1.TLSGroup{"X25519"}}
+	onTLSProfileChange(t.Context(), spec, spec)
+}
+
+func TestOnTLSProfileChangeExitsWhenGroupsChange(t *testing.T) {
+	if os.Getenv("TLS_PROFILE_CHANGE_HELPER") == "1" {
+		onTLSProfileChange(t.Context(),
+			configv1.TLSProfileSpec{Groups: []configv1.TLSGroup{"X25519"}},
+			configv1.TLSProfileSpec{Groups: []configv1.TLSGroup{"secp256r1"}})
+
+		return
+	}
+
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=TestOnTLSProfileChangeExitsWhenGroupsChange")
+
+	cmd.Env = append(os.Environ(), "TLS_PROFILE_CHANGE_HELPER=1")
+
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+}
+
+func newTLSConfigMap(data map[string]string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: sdktls.ConfigMapName, Namespace: "addon-ns"},
+		Data:       data,
+	}
+}
+
+// allowSelfSubjectAccessReviews makes the fake clientset allow every SelfSubjectAccessReview;
+// otherwise the echoed object's zero Allowed status looks like a denial.
+func allowSelfSubjectAccessReviews(
+	client *testclient.Clientset, onReview ...func(*authorizationv1.SelfSubjectAccessReview),
+) {
 	client.PrependReactor("create", "selfsubjectaccessreviews",
 		func(action k8stesting.Action) (bool, runtime.Object, error) {
 			//nolint:forcetypeassert
 			review := action.(k8stesting.CreateAction).GetObject().(*authorizationv1.SelfSubjectAccessReview)
 			review.Status.Allowed = true
 
+			for _, fn := range onReview {
+				fn(review)
+			}
+
 			return true, review, nil
 		},
 	)
 }
 
-func TestResolveTLSConfigFlagsTakePrecedence(t *testing.T) {
-	wantVersion, err := sdktls.ParseTLSVersion("VersionTLS13")
-	require.NoError(t, err)
+// newFakeAPIServer serves discovery and the APIServer object.
+func newFakeAPIServer(
+	t *testing.T, serveOpenShiftAPI bool, tlsGroups ...string,
+) *rest.Config {
+	t.Helper()
 
-	// A nil kubeClient would panic if resolveTLSConfig tried to use it, proving the
-	// ConfigMap path is skipped when the flags are set.
-	cfg, err := resolveTLSConfig(t.Context(), "VersionTLS13", "", nil, "", func() {})
+	group := "apps"
+	if serveOpenShiftAPI {
+		group = configv1.GroupName
+	}
 
-	require.NoError(t, err)
-	require.NotNil(t, cfg)
-	assert.Equal(t, wantVersion, cfg.MinVersion)
+	groupVersion := group + "/v1"
+	apiGroups := fmt.Sprintf(
+		`{"kind":"APIGroupList","apiVersion":"v1","groups":[`+
+			`{"name":%q,"versions":[{"groupVersion":%q,"version":"v1"}],`+
+			`"preferredVersion":{"groupVersion":%q,"version":"v1"}}]}`,
+		group, groupVersion, groupVersion)
+
+	profile := `{"type":"Modern"}`
+
+	if len(tlsGroups) > 0 {
+		profile = fmt.Sprintf(`{"type":"Custom","custom":{"groups":["%s"]}}`, strings.Join(tlsGroups, `","`))
+	}
+
+	return &rest.Config{
+		Host: "https://api.example.test",
+		Transport: restfake.CreateHTTPClient(func(r *http.Request) (*http.Response, error) {
+			path := r.URL.Path
+
+			var body string
+
+			status := http.StatusOK
+
+			switch {
+			case path == "/api":
+				body = `{"kind":"APIVersions","apiVersion":"v1","versions":["v1"]}`
+			case path == "/apis":
+				body = apiGroups
+			case serveOpenShiftAPI && strings.HasSuffix(path, "/apiservers/"+openshifttls.APIServerName):
+				body = `{"apiVersion":"config.openshift.io/v1","kind":"APIServer",` +
+					`"metadata":{"name":"cluster"},"spec":{"tlsSecurityProfile":` + profile + `}}`
+			case serveOpenShiftAPI && strings.HasPrefix(path, "/apis/"):
+				body = `{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"` +
+					strings.TrimPrefix(path, "/apis/") +
+					`","resources":[{"name":"apiservers","kind":"APIServer","namespaced":false}]}`
+			case strings.HasPrefix(path, "/apis/"):
+				status = http.StatusNotFound
+				body = `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`
+			default:
+				return nil, errors.New("unexpected path: " + path)
+			}
+
+			return &http.Response{
+				StatusCode: status,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		}).Transport,
+	}
 }
 
-func TestResolveTLSConfigInvalidFlagsReturnsError(t *testing.T) {
-	_, err := resolveTLSConfig(t.Context(), "not-a-version", "", nil, "", func() {})
+// TestParseOptsTLSGroups covers main.go. Kept here because main_test.go is e2e-tagged.
+func TestParseOptsTLSGroups(t *testing.T) {
+	oldArgs, oldCommandLine := os.Args, pflag.CommandLine
 
-	assert.Error(t, err)
-}
-
-func TestResolveTLSConfigNoFlagsNoClusterFallsBackToNil(t *testing.T) {
-	cfg, err := resolveTLSConfig(t.Context(), "", "", nil, "", func() {})
-
-	require.NoError(t, err)
-	assert.Nil(t, cfg, "expected nil config so caller falls back to a TLS 1.2 floor with Go's default cipher suites")
-}
-
-func TestResolveTLSConfigReadsConfigMapWhenNoFlags(t *testing.T) {
-	client := testclient.NewSimpleClientset(&corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      sdktls.ConfigMapName,
-			Namespace: "addon-ns",
-		},
-		Data: map[string]string{
-			sdktls.ConfigMapKeyMinVersion: "VersionTLS13",
-		},
+	t.Cleanup(func() {
+		os.Args, pflag.CommandLine = oldArgs, oldCommandLine
 	})
-	allowSelfSubjectAccessReviews(client)
 
-	cfg, err := resolveTLSConfig(t.Context(), "", "", client, "addon-ns", func() {})
+	pflag.CommandLine = pflag.NewFlagSet("parse-opts-test", pflag.ContinueOnError)
+	os.Args = []string{"parse-opts-test", "--tls-groups=X25519,secp256r1"}
 
-	require.NoError(t, err)
-	require.NotNil(t, cfg)
-
-	wantVersion, err := sdktls.ParseTLSVersion("VersionTLS13")
-	require.NoError(t, err)
-	assert.Equal(t, wantVersion, cfg.MinVersion)
-}
-
-func TestResolveTLSConfigDefaultsWhenConfigMapAbsent(t *testing.T) {
-	client := testclient.NewSimpleClientset()
-	allowSelfSubjectAccessReviews(client)
-
-	cfg, err := resolveTLSConfig(t.Context(), "", "", client, "addon-ns", func() {})
-
-	require.NoError(t, err)
-	require.NotNil(t, cfg)
-	assert.Equal(t, sdktls.GetDefaultTLSConfig().MinVersion, cfg.MinVersion)
-}
-
-func TestResolveTLSConfigMissingConfigMapPermissionReturnsError(t *testing.T) {
-	// No allowSelfSubjectAccessReviews call: the fake client's default reaction leaves
-	// Status.Allowed at its false zero value, simulating denied RBAC.
-	client := testclient.NewSimpleClientset(&corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      sdktls.ConfigMapName,
-			Namespace: "addon-ns",
-		},
-	})
-
-	_, err := resolveTLSConfig(t.Context(), "", "", client, "addon-ns", func() {})
-
-	assert.Error(t, err)
+	assert.Equal(t, "X25519,secp256r1", parseOpts().tlsGroups)
 }

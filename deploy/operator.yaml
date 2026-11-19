@@ -68,6 +68,14 @@ rules:
   - create
   - patch
 - apiGroups:
+  - config.openshift.io
+  resources:
+  - apiservers
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - policy.open-cluster-management.io
   resources:
   - certificatepolicies
